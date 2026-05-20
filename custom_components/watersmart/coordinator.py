@@ -8,11 +8,19 @@ import logging
 from typing import Any, Protocol, TypedDict, cast
 
 from aiohttp.client_exceptions import ClientConnectorError
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import StatisticData
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+    statistics_during_period,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util.dt import as_local, get_default_time_zone, start_of_local_day
 
+from . import statistics as stats
 from .client import AuthenticationError, UsageRecord, WaterSmartClient
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, MANUFACTURER, SensorKey
 from .types import SensorData
@@ -20,6 +28,14 @@ from .types import SensorData
 EXCEPTIONS = (AuthenticationError, ClientConnectorError)
 
 _LOGGER = logging.getLogger(__name__)
+
+# The recorder returns values in the series' own unit; folding happens in that
+# unit, so no conversion to the metadata unit is wanted.
+_RECORDER_NO_UNIT_CONVERSION = False
+
+
+class _RecorderQueryFailed(Exception):
+    """A recorder query raised; the statistics import is abandoned this cycle."""
 
 
 class CoordinatorData(TypedDict, total=False):
@@ -47,6 +63,8 @@ class WaterSmartUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         watersmart: WaterSmartClient,
         hostname: str,
         username: str,
+        *,
+        entry_id: str,
     ) -> None:
         """Initialize."""
 
@@ -60,6 +78,7 @@ class WaterSmartUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self.watersmart = watersmart
         self.hostname = hostname
         self.username = username
+        self.entry_id = entry_id
         self.device_info = _get_device_info(hostname, username)
         self.data: CoordinatorData = {}
         self.data_converters = (
@@ -89,9 +108,106 @@ class WaterSmartUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 result
             )
 
+        await self._insert_statistics(result["hourly"])
+
         _LOGGER.debug("Async update complete")
 
         return result
+
+    async def _insert_statistics(self, hourly: list[UsageRecord]) -> None:
+        """Import the hourly series into HA's long-term statistics.
+
+        Cold start: fold every record against a zero anchor and upsert.
+
+        Warm refresh: re-fold the trailing window onto the most recent anchor
+        row so late upstream corrections are absorbed (see :mod:`.statistics`).
+
+        Errors from the recorder are logged and swallowed: a recorder failure
+        must not mask the sensor data the refresh succeeded in producing.
+        """
+        try:
+            anchor = await self._resolve_anchor()
+            rows = stats.fold_cumulative(stats.bucket_records(hourly), anchor)
+            if not rows:
+                _LOGGER.debug("No new statistics buckets to import")
+                return
+            self._write_statistics(rows)
+        except _RecorderQueryFailed:
+            return
+
+        _LOGGER.debug("Imported %d statistics rows", len(rows))
+
+    async def _resolve_anchor(self) -> stats.Anchor:
+        """Resolve the cumulative anchor the trailing window folds onto.
+
+        Returns:
+            A cold-start anchor when no prior statistics exist, otherwise the
+            warm-refresh anchor selected from the recorder.
+        """
+        statistic_id = stats.statistic_id_for(self.entry_id)
+
+        last = await self._recorder_query(
+            "read last statistics",
+            get_last_statistics,
+            self.hass,
+            1,
+            statistic_id,
+            _RECORDER_NO_UNIT_CONVERSION,
+            {"sum"},
+        )
+        last_rows = last.get(statistic_id, [])
+        if not last_rows:
+            return stats.COLD_START
+
+        last_row = last_rows[0]
+        window_start, window_end = stats.anchor_window(last_row)
+        window = await self._recorder_query(
+            "look up anchor statistics",
+            statistics_during_period,
+            self.hass,
+            window_start,
+            window_end,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        return stats.select_anchor(window.get(statistic_id, []))
+
+    async def _recorder_query(
+        self,
+        description: str,
+        func: Callable[..., dict[str, Any]],
+        *args: object,
+    ) -> dict[str, Any]:
+        """Run a recorder query off the event loop, swallowing failures.
+
+        Returns:
+            The query result keyed by statistic id.
+
+        Raises:
+            _RecorderQueryFailed: If ``func`` raised.
+        """
+        try:
+            result = await get_instance(self.hass).async_add_executor_job(func, *args)
+        except Exception as error:
+            _LOGGER.warning("Failed to %s", description, exc_info=True)
+            raise _RecorderQueryFailed from error
+        # async_add_executor_job's stub erases func's return type to Any.
+        return cast("dict[str, Any]", result)
+
+    def _write_statistics(self, rows: list[StatisticData]) -> None:
+        """Upsert statistic rows.
+
+        Raises:
+            _RecorderQueryFailed: If the recorder write failed.
+        """
+        metadata = stats.metadata_for(self.entry_id, self.hostname)
+        try:
+            async_add_external_statistics(self.hass, metadata, rows)
+        except Exception as error:
+            _LOGGER.warning("Failed to write statistics", exc_info=True)
+            raise _RecorderQueryFailed from error
 
 
 def _get_device_info(hostname: str, username: str) -> DeviceInfo:

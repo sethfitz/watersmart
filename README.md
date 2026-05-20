@@ -77,6 +77,28 @@ Gallons of water used on the most recent hour of data available.
 * `related`: List of related objects with `start` and `gallons` starting from the most recent
   hour.
 
+## Energy dashboard
+
+The integration imports the hourly water-usage series into Home Assistant's
+long-term statistics, making it available to the [Energy dashboard's water
+consumption section][energy-water]. On first run, the entire history WaterSmart
+exposes for the account is backfilled in a single import. Subsequent refreshes
+re-fold the last 48 hours from a known-good anchor row and upsert into the
+recorder — this picks up any historical corrections WaterSmart restates within
+that window.
+
+The statistic appears in the Energy dashboard's water-source picker labeled
+`Water consumption (<host>)`. The underlying `statistic_id` is anchored on the
+config entry's internal id (`watersmart:<entry_id>`), so the series survives
+re-authentication and host/username edits without orphaning.
+
+### Known limitations
+
+- Historical corrections that WaterSmart emits more than 48 hours after the
+  fact are not picked up automatically. If this matters for a particular
+  account, removing and re-adding the config entry triggers a fresh full
+  backfill.
+
 ## Services
 
 ### `watersmart.get_hourly_history`
@@ -97,6 +119,7 @@ Icon designed by [bsd studio][bsd-attribution].
 
 [bsd-attribution]: https://thenounproject.com/creator/nesterenko.ruslan
 [config-flow-start]: https://my.home-assistant.io/redirect/config_flow_start/?domain=watersmart
+[energy-water]: https://www.home-assistant.io/docs/energy/water/
 [hacs]: https://hacs.xyz/
 [hacs-repo]: https://github.com/hacs/integration
 [hacs-badge]: https://my.home-assistant.io/badges/hacs_repository.svg
