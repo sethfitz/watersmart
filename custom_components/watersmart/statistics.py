@@ -82,9 +82,8 @@ def bucket_records(
     """Group records by UTC hour.
 
     Drops records with ``gallons is None``; sums multiple records that fall
-    within the same UTC hour (which happens at DST transitions and other
-    timestamp-jitter edges in the source data); returns the result sorted
-    chronologically.
+    within the same UTC hour (sub-hour timestamp jitter in the source data can
+    place two readings in one hour); returns the result sorted chronologically.
 
     Returns:
         ``(hour_start_utc, gallons)`` pairs sorted chronologically.
@@ -108,9 +107,11 @@ def fold_cumulative(
     """Fold per-hour gallons after ``anchor`` into cumulative-sum statistic rows.
 
     Buckets at or before ``anchor.start`` are dropped; the rest accumulate onto
-    ``anchor.sum``. ``state`` and ``sum`` are both set to the running
-    cumulative; the Energy dashboard reads ``sum`` and HA's external-statistics
-    convention is that ``state`` mirrors it.
+    ``anchor.sum`` to form each row's ``sum``. Each row's ``state`` is that
+    hour's own gallons, not the running total: HA's external-statistics
+    convention pairs a per-period ``state`` with the cumulative ``sum`` (the
+    Energy dashboard reads ``sum``, and the statistics UI derives each period's
+    change from consecutive sums while ``state`` records the period value).
 
     Returns:
         Cumulative-sum statistic rows in chronological order.
@@ -121,7 +122,7 @@ def fold_cumulative(
         if anchor.start is not None and start <= anchor.start:
             continue
         running += gallons
-        rows.append(StatisticData(start=start, state=running, sum=running))
+        rows.append(StatisticData(start=start, state=gallons, sum=running))
     return rows
 
 

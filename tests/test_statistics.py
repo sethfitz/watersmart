@@ -142,7 +142,8 @@ def test_fold_cumulative_from_zero():
     rows = fold_cumulative(buckets, COLD_START)
     assert [r["start"] for r in rows] == [b[0] for b in buckets]
     assert [r["sum"] for r in rows] == [1.0, 3.0, 6.0]
-    assert [r["state"] for r in rows] == [1.0, 3.0, 6.0]
+    # state is each hour's own gallons (per-period), not the running cumulative.
+    assert [r["state"] for r in rows] == [1.0, 2.0, 3.0]
 
 
 def test_fold_cumulative_continues_from_anchor_sum():
@@ -152,7 +153,8 @@ def test_fold_cumulative_continues_from_anchor_sum():
     ]
     rows = fold_cumulative(buckets, Anchor(start=_utc(2026, 5, 1, 2), sum=100.0))
     assert [r["sum"] for r in rows] == [101.0, 103.0]
-    assert [r["state"] for r in rows] == [101.0, 103.0]
+    # state is the per-hour gallons; only sum carries the anchor's cumulative.
+    assert [r["state"] for r in rows] == [1.0, 2.0]
 
 
 def test_fold_cumulative_drops_buckets_at_or_before_anchor():
